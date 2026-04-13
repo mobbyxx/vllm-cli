@@ -1,0 +1,25 @@
+# Binaries
+vllm-cli
+vllm-cli-nocgo
+vllm-cli-arm64
+vllm-cli-linux-*
+*.exe
+
+# Build artifacts
+dist/
+
+# Sisyphus internal files
+.sisyphus/
+
+# Go
+*.test
+*.out
+vendor/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test helper programs (internal use only)
+cmd/test-*/
+cmd/qa-docker/
