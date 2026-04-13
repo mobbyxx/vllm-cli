@@ -1,3 +1,6 @@
+// Package components provides reusable Bubble Tea UI components: a spinner
+// for long-running operations, a table renderer for tabular output, and a
+// memory bar for visualising GPU utilisation.
 package components
 
 import (

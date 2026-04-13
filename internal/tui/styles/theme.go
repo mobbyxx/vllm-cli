@@ -1,3 +1,5 @@
+// Package styles defines the lipgloss style palette used across all vllm-cli
+// terminal output: Title, Success, Warning, Error, Muted, Bold, and Header.
 package styles
 
 import "github.com/charmbracelet/lipgloss"

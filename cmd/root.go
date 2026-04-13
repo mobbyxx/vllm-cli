@@ -1,3 +1,7 @@
+// Package cmd implements the vllm-cli command-line interface using Cobra.
+// Each subcommand (run, pull, stop, list, ps, rm, show) lives in its own file
+// and self-registers with rootCmd via an init() function. The Execute() function
+// is the single entry point called from main.go.
 package cmd
 
 import (

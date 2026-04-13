@@ -1,3 +1,7 @@
+// Package tui provides TTY-aware output helpers for the vllm-cli terminal UI.
+// IsTTY() gates all color/style rendering so that piped output remains
+// clean plain text. PrintError, PrintSuccess, and PrintWarning are the
+// primary output functions used throughout the cmd layer.
 package tui
 
 import (

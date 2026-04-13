@@ -1,3 +1,6 @@
+// Package docker provides a high-level wrapper around the Docker SDK for
+// managing vLLM containers. It handles container creation, lifecycle (start,
+// stop, remove), image pulls, port management, and health polling.
 package docker
 
 import (

@@ -1,5 +1,8 @@
 //go:build cgo
 
+// Package gpu provides GPU detection and memory reporting via NVML.
+// This file is compiled when CGO is enabled (the default). The !cgo variant
+// in detector_nocgo.go is compiled for CGO_ENABLED=0 builds.
 package gpu
 
 import (

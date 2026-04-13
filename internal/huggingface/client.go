@@ -1,3 +1,6 @@
+// Package huggingface provides a client for the HuggingFace Hub API and local
+// cache scanning. It fetches model metadata, config.json architecture parameters,
+// and manages the ~/.cache/huggingface/hub directory layout.
 package huggingface
 
 import (

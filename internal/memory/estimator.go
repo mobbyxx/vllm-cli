@@ -1,3 +1,6 @@
+// Package memory estimates GPU memory requirements for a given model and
+// enforces a pre-flight memory guard before container creation. It covers
+// weights, KV cache, and CUDA overhead for both discrete and unified GPUs.
 package memory
 
 import (
