@@ -37,13 +37,16 @@ docker run --rm --gpus all nvidia/cuda:12.0-base nvidia-smi
 
 ### Option A: Download pre-built binary
 
+**amd64 (standard Linux / x86_64):**
 ```bash
-# amd64
 curl -L https://github.com/mobbyxx/vllm-cli/releases/latest/download/vllm-cli-linux-amd64 -o vllm-cli
+chmod +x vllm-cli
+sudo mv vllm-cli /usr/local/bin/vllm-cli
+```
 
-# arm64 (DGX Spark / Grace Blackwell)
+**arm64 (DGX Spark / Grace Blackwell):**
+```bash
 curl -L https://github.com/mobbyxx/vllm-cli/releases/latest/download/vllm-cli-linux-arm64 -o vllm-cli
-
 chmod +x vllm-cli
 sudo mv vllm-cli /usr/local/bin/vllm-cli
 ```

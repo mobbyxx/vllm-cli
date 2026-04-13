@@ -1,0 +1,62 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build & Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Build amd64
+        run: |
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w -X github.com/user/vllm-cli/cmd.Version=${{ github.ref_name }}" -o vllm-cli-linux-amd64 .
+
+      - name: Build arm64
+        run: |
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w -X github.com/user/vllm-cli/cmd.Version=${{ github.ref_name }}" -o vllm-cli-linux-arm64 .
+
+      - name: Create checksums
+        run: |
+          sha256sum vllm-cli-linux-amd64 vllm-cli-linux-arm64 > checksums.txt
+          cat checksums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          body: |
+            ## Installation
+
+            **amd64 (standard Linux / x86_64):**
+            ```bash
+            curl -L https://github.com/mobbyxx/vllm-cli/releases/download/${{ github.ref_name }}/vllm-cli-linux-amd64 -o vllm-cli
+            chmod +x vllm-cli
+            sudo mv vllm-cli /usr/local/bin/vllm-cli
+            ```
+
+            **arm64 (DGX Spark / Grace Blackwell):**
+            ```bash
+            curl -L https://github.com/mobbyxx/vllm-cli/releases/download/${{ github.ref_name }}/vllm-cli-linux-arm64 -o vllm-cli
+            chmod +x vllm-cli
+            sudo mv vllm-cli /usr/local/bin/vllm-cli
+            ```
+          files: |
+            vllm-cli-linux-amd64
+            vllm-cli-linux-arm64
+            checksums.txt
+          generate_release_notes: true
