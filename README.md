@@ -50,29 +50,26 @@ sudo mv vllm-cli /usr/local/bin/vllm-cli
 
 ### Option B: Build from source
 
+Requires [Go 1.21+](https://go.dev/dl/).
+
 ```bash
-# Prerequisites: Go 1.21+
 git clone https://github.com/mobbyxx/vllm-cli.git
 cd vllm-cli
 
 # Standard build (with NVML GPU detection)
 go build -o vllm-cli .
 
-# No-CGO build (no NVML, GPU detection via /proc/meminfo only)
+# No-CGO build (GPU detection via /proc/meminfo only)
 CGO_ENABLED=0 go build -o vllm-cli .
 
 sudo mv vllm-cli /usr/local/bin/vllm-cli
 ```
 
-### Copy to DGX Spark
+For **arm64 (DGX Spark / Grace Blackwell)**, cross-compile on your build machine:
 
 ```bash
-# Cross-compile for ARM64 on an x86 machine:
-GOOS=linux GOARCH=arm64 go build -o vllm-cli-arm64 .
-
-# Copy to Spark:
-scp vllm-cli-arm64 user@SPARK_IP:~/bin/vllm-cli
-ssh user@SPARK_IP "chmod +x ~/bin/vllm-cli"
+GOOS=linux GOARCH=arm64 go build -o vllm-cli .
+sudo mv vllm-cli /usr/local/bin/vllm-cli
 ```
 
 ### Verify installation
