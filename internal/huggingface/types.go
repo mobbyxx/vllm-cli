@@ -2,13 +2,29 @@ package huggingface
 
 import "encoding/json"
 
+// ModelSibling represents a single file in the model repository.
+type ModelSibling struct {
+	RFilename string `json:"rfilename"`
+	Size      int64  `json:"size"`
+}
+
 // ModelInfo holds metadata from the HuggingFace API for a model.
 type ModelInfo struct {
-	ID          string      `json:"id"`
-	PipelineTag string      `json:"pipeline_tag"`
-	LibraryName string      `json:"library_name"`
-	Gated       interface{} `json:"gated"` // can be bool or string
-	Downloads   int         `json:"downloads"`
+	ID          string         `json:"id"`
+	PipelineTag string         `json:"pipeline_tag"`
+	LibraryName string         `json:"library_name"`
+	Gated       interface{}    `json:"gated"` // can be bool or string
+	Downloads   int            `json:"downloads"`
+	Siblings    []ModelSibling `json:"siblings"`
+}
+
+// TotalSize returns the sum of all file sizes in the model repository.
+func (m *ModelInfo) TotalSize() int64 {
+	var total int64
+	for _, s := range m.Siblings {
+		total += s.Size
+	}
+	return total
 }
 
 // IsGated returns true if the model requires authentication.

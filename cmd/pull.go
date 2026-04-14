@@ -1,9 +1,9 @@
 package cmd
 
 import (
+	"context"
 	stderrors "errors"
 	"fmt"
-	"os"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -17,6 +17,8 @@ import (
 	"github.com/user/vllm-cli/internal/tui/components"
 	"github.com/user/vllm-cli/internal/types"
 )
+
+var pullImage string
 
 var pullCmd = &cobra.Command{
 	Use:   "pull <model>",
@@ -35,6 +37,7 @@ Set HF_TOKEN environment variable for gated models.`,
 
 func init() {
 	rootCmd.AddCommand(pullCmd)
+	pullCmd.Flags().StringVar(&pullImage, "image", "", "Override the vLLM Docker image (default: from config)")
 }
 
 func runPull(modelArg string) error {
@@ -57,6 +60,10 @@ func runPull(modelArg string) error {
 		return nil
 	}
 
+	if pullImage != "" {
+		cfg.DockerImage = pullImage
+	}
+
 	cached, err := huggingface.FindCachedModel(cfg.HFCachePath, ref)
 	if err != nil {
 		tui.PrintError(clierrors.NewCLIError(
@@ -72,11 +79,11 @@ func runPull(modelArg string) error {
 	}
 
 	hfClient := huggingface.NewClient()
-	_, err = hfClient.GetModelInfo(ref)
+	modelInfo, err := hfClient.GetModelInfo(ref)
 	if err != nil {
 		var cliErr *clierrors.CLIError
 		if stderrors.As(err, &cliErr) {
-			if os.Getenv("HF_TOKEN") == "" {
+			if huggingface.ResolveToken() == "" {
 				tui.PrintError(clierrors.NewCLIError(
 					fmt.Sprintf("model %q not found on HuggingFace (or requires authentication)", ref.String()),
 					fmt.Sprintf("Set HF_TOKEN if this is a gated model, or verify the model ID at https://huggingface.co/%s", ref.String()),
@@ -130,7 +137,7 @@ func runPull(modelArg string) error {
 		fmt.Printf("Docker image ready.\n")
 	}
 
-	hfToken := os.Getenv("HF_TOKEN")
+	hfToken := huggingface.ResolveToken()
 	opts := docker.ContainerOpts{
 		ModelRef:    ref,
 		Port:        0,
@@ -150,41 +157,60 @@ func runPull(modelArg string) error {
 		return nil
 	}
 
+	totalSize := modelInfo.TotalSize()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dlProgressCh := huggingface.WatchDownloadProgress(ctx, cfg.HFCachePath, ref, totalSize, 2*time.Second)
+
+	doneCh := make(chan error, 1)
+	go func() {
+		doneCh <- waitForContainerExit(dockerClient, ref.Slug())
+		close(doneCh)
+	}()
+
+	var downloadErr error
+
 	if isTTY {
-		done := make(chan error, 2)
-		go func() {
-			done <- waitForContainerExit(dockerClient, ref.Slug())
-		}()
-		p := tea.NewProgram(components.NewSpinner(fmt.Sprintf("Downloading %s", ref.String())))
-		go func() {
-			result := <-done
-			done <- result
-			p.Quit()
-		}()
-		p.Run()
-		if err := <-done; err != nil {
-			_ = dockerClient.Remove(containerInfo.ID)
-			tui.PrintError(clierrors.NewCLIError(
-				"waiting for download container",
-				"Check Docker logs for details",
-				err,
-			))
-			return nil
-		}
+		model := components.NewDownloadModel(ref.String(), totalSize, dlProgressCh, doneCh)
+		p := tea.NewProgram(model)
+		finalModel, _ := p.Run()
+		final := finalModel.(components.DownloadModel)
+		downloadErr = final.Err()
 	} else {
 		fmt.Printf("Downloading %s...\n", ref.String())
-		if err := waitForContainerExit(dockerClient, ref.Slug()); err != nil {
-			_ = dockerClient.Remove(containerInfo.ID)
-			tui.PrintError(clierrors.NewCLIError(
-				"waiting for download container",
-				"Check Docker logs for details",
-				err,
-			))
-			return nil
+		lastPct := -1
+		for {
+			select {
+			case prog, ok := <-dlProgressCh:
+				if ok && prog.Total > 0 {
+					pct := int(float64(prog.Downloaded) / float64(prog.Total) * 100)
+					if pct != lastPct && pct%5 == 0 {
+						fmt.Printf("  %d%% — %s / %s\n", pct,
+							huggingface.FormatSize(prog.Downloaded),
+							huggingface.FormatSize(prog.Total))
+						lastPct = pct
+					}
+				}
+			case err := <-doneCh:
+				downloadErr = err
+				goto downloadDone
+			}
 		}
+	downloadDone:
 	}
 
+	cancel()
 	_ = dockerClient.Remove(containerInfo.ID)
+
+	if downloadErr != nil {
+		tui.PrintError(clierrors.NewCLIError(
+			"waiting for download container",
+			"Check Docker logs for details",
+			downloadErr,
+		))
+		return nil
+	}
 
 	pulled, err := huggingface.FindCachedModel(cfg.HFCachePath, ref)
 	if err != nil || pulled == nil {

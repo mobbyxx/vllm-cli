@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"time"
 
 	clierrors "github.com/user/vllm-cli/internal/errors"
@@ -31,7 +30,7 @@ type Client struct {
 func NewClient() *Client {
 	return &Client{
 		http:    &http.Client{Timeout: hfTimeout},
-		hfToken: os.Getenv("HF_TOKEN"),
+		hfToken: ResolveToken(),
 	}
 }
 

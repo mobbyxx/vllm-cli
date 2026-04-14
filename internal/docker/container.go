@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/containerd/errdefs"
 	dockercontainer "github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/mount"
@@ -44,6 +45,22 @@ func (c *Client) CreateAndStart(opts ContainerOpts) (*types.ContainerInfo, error
 	ctx := context.Background()
 
 	containerName := containerNameFor(opts.ModelRef)
+
+	existing, err := c.cli.ContainerList(ctx, dockercontainer.ListOptions{
+		All:     true,
+		Filters: filters.NewArgs(filters.Arg("name", "^/"+containerName+"$")),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("checking for existing container: %w", err)
+	}
+	for _, ctr := range existing {
+		if ctr.State != "running" {
+			fmt.Printf("Removing stale container %s...\n", containerName)
+			if err := c.cli.ContainerRemove(ctx, ctr.ID, dockercontainer.RemoveOptions{Force: true}); err != nil {
+				return nil, fmt.Errorf("removing stale container: %w", err)
+			}
+		}
+	}
 
 	// Build command
 	cmd := []string{
@@ -128,15 +145,19 @@ func (c *Client) CreateAndStart(opts ContainerOpts) (*types.ContainerInfo, error
 	}, nil
 }
 
-// Stop stops a container gracefully (30s timeout) then removes it.
+// Stop stops a container gracefully (30s timeout) then force-removes it.
 func (c *Client) Stop(containerID string) error {
 	ctx := context.Background()
 	timeout := 30
 	if err := c.cli.ContainerStop(ctx, containerID, dockercontainer.StopOptions{Timeout: &timeout}); err != nil {
-		return fmt.Errorf("stopping container: %w", err)
+		if !errdefs.IsNotFound(err) && !errdefs.IsNotModified(err) {
+			return fmt.Errorf("stopping container: %w", err)
+		}
 	}
-	if err := c.cli.ContainerRemove(ctx, containerID, dockercontainer.RemoveOptions{}); err != nil {
-		return fmt.Errorf("removing container after stop: %w", err)
+	if err := c.cli.ContainerRemove(ctx, containerID, dockercontainer.RemoveOptions{Force: true}); err != nil {
+		if !errdefs.IsNotFound(err) {
+			return fmt.Errorf("removing container after stop: %w", err)
+		}
 	}
 	return nil
 }

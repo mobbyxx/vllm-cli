@@ -31,6 +31,7 @@ var (
 	runDtype              string
 	runMaxModelLen        int
 	runTensorParallelSize int
+	runImage              string
 )
 
 var runCmd = &cobra.Command{
@@ -58,6 +59,7 @@ func init() {
 	runCmd.Flags().StringVar(&runDtype, "dtype", "", "Data type (float16, bfloat16, auto)")
 	runCmd.Flags().IntVar(&runMaxModelLen, "max-model-len", 0, "Maximum sequence length (context window)")
 	runCmd.Flags().IntVar(&runTensorParallelSize, "tensor-parallel-size", 1, "Number of GPUs for tensor parallelism")
+	runCmd.Flags().StringVar(&runImage, "image", "", "Override the vLLM Docker image (default: from config)")
 }
 
 func runRun(modelArg string) error {
@@ -78,6 +80,10 @@ func runRun(modelArg string) error {
 	if err != nil {
 		tui.PrintError(clierrors.NewCLIError("failed to load config", "Check your config file", err))
 		return nil
+	}
+
+	if runImage != "" {
+		cfg.DockerImage = runImage
 	}
 
 	dockerClient, err := docker.NewClient()
@@ -186,11 +192,14 @@ func runRun(modelArg string) error {
 		extraArgs = append(extraArgs, "--tensor-parallel-size", fmt.Sprintf("%d", runTensorParallelSize))
 	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	opts := docker.ContainerOpts{
 		ModelRef:    ref,
 		Port:        port,
 		HFCachePath: cfg.HFCachePath,
-		HFToken:     os.Getenv("HF_TOKEN"),
+		HFToken:     huggingface.ResolveToken(),
 		DockerImage: cfg.DockerImage,
 		ExtraArgs:   extraArgs,
 		GPUMemUtil:  runGPUMemUtil,
@@ -206,54 +215,72 @@ func runRun(modelArg string) error {
 		return nil
 	}
 
+	if ctx.Err() != nil {
+		_ = dockerClient.Stop(containerInfo.ID)
+		fmt.Println("\nAborted.")
+		return nil
+	}
+
 	fmt.Printf("Starting %s on port %d...\n", ref.String(), port)
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	healthCh := docker.WaitForHealthyAsync(port, 300*time.Second)
+	logCh := make(chan string, 64)
+	_ = dockerClient.StreamLogs(ctx, containerInfo.ID, logCh)
 
-	healthDone := make(chan error, 2)
-	go func() {
-		healthDone <- docker.WaitForHealthy(port, 300*time.Second)
-	}()
+	var startupErr error
 
 	if isTTY {
-		p := tea.NewProgram(components.NewSpinner(fmt.Sprintf("Waiting for %s", ref.String())))
+		model := components.NewStartupModel(ref.String(), logCh, healthCh)
+		p := tea.NewProgram(model)
+
 		go func() {
-			var result error
-			select {
-			case result = <-healthDone:
-				healthDone <- result
-			case <-ctx.Done():
-			}
+			<-ctx.Done()
 			p.Quit()
 		}()
-		p.Run()
-	} else {
-		fmt.Println("Waiting...")
-	}
 
-	select {
-	case healthErr := <-healthDone:
-		if healthErr != nil {
+		finalModel, _ := p.Run()
+		final := finalModel.(components.StartupModel)
+
+		if final.Quitted() || ctx.Err() != nil {
+			fmt.Println("\nStopping...")
 			_ = dockerClient.Stop(containerInfo.ID)
-			tui.PrintError(clierrors.NewCLIError(
-				"model failed to start within 300s",
-				fmt.Sprintf("Check logs with 'docker logs vllm-%s'", ref.Slug()),
-				nil,
-			))
+			fmt.Println("Stopped.")
 			return nil
 		}
-		tui.PrintSuccess(fmt.Sprintf("Model %s is ready!", ref.String()))
-		fmt.Printf("  OpenAI-compatible API: http://localhost:%d/v1\n", port)
-		fmt.Printf("  Health endpoint:       http://localhost:%d/health\n", port)
-		return nil
 
-	case <-ctx.Done():
-		fmt.Println("\nStopping...")
-		_ = dockerClient.Stop(containerInfo.ID)
-		fmt.Println("Stopped.")
-		os.Exit(0)
+		startupErr = final.Err()
+	} else {
+		for {
+			select {
+			case line, ok := <-logCh:
+				if ok {
+					fmt.Println(line)
+				}
+			case healthErr := <-healthCh:
+				startupErr = healthErr
+				goto done
+			case <-ctx.Done():
+				fmt.Println("\nStopping...")
+				_ = dockerClient.Stop(containerInfo.ID)
+				fmt.Println("Stopped.")
+				return nil
+			}
+		}
+	done:
 	}
 
+	if startupErr != nil {
+		_ = dockerClient.Stop(containerInfo.ID)
+		tui.PrintError(clierrors.NewCLIError(
+			"model failed to start within 300s",
+			fmt.Sprintf("Check logs with 'docker logs vllm-%s'", ref.Slug()),
+			nil,
+		))
+		return nil
+	}
+
+	tui.PrintSuccess(fmt.Sprintf("Model %s is ready!", ref.String()))
+	fmt.Printf("  OpenAI-compatible API: http://localhost:%d/v1\n", port)
+	fmt.Printf("  Health endpoint:       http://localhost:%d/health\n", port)
 	return nil
 }
