@@ -148,33 +148,136 @@ func (c *Client) GetModelConfig(ref types.ModelRef) (*ModelConfig, error) {
 
 // EstimateParameterCount estimates the number of parameters from config.json
 // if NumParameters is not set directly.
-func EstimateParameterCount(cfg *ModelConfig) int64 {
+// Returns (totalParams, activeParams) where activeParams < totalParams for MoE models.
+func EstimateParameterCount(cfg *ModelConfig) (total int64, active int64) {
 	if cfg.NumParameters > 0 {
-		return cfg.NumParameters
+		return cfg.NumParameters, cfg.NumParameters
 	}
 
 	if cfg.HiddenSize == 0 || cfg.NumHiddenLayers == 0 {
-		return 0
+		return 0, 0
 	}
 
-	var params int64
+	h := int64(cfg.HiddenSize)
+	nLayers := int64(cfg.NumHiddenLayers)
 
 	// Embedding layer: vocab_size × hidden_size
-	params += int64(cfg.VocabSize) * int64(cfg.HiddenSize)
+	embedding := int64(cfg.VocabSize) * h
+	total += embedding
+	active += embedding
 
-	// Attention per layer: 4 × hidden_size²
-	// (Q, K, V, O projections — simplified, doesn't account for GQA exactly)
-	attentionParams := int64(cfg.NumHiddenLayers) * 4 * int64(cfg.HiddenSize) * int64(cfg.HiddenSize)
-	params += attentionParams
+	// --- Attention ---
+	numHeads := cfg.NumAttentionHeads
+	if numHeads == 0 {
+		numHeads = 1
+	}
 
-	// MLP per layer (SwiGLU): 3 × hidden_size × intermediate_size
-	if cfg.IntermediateSize > 0 {
-		mlpParams := int64(cfg.NumHiddenLayers) * 3 * int64(cfg.HiddenSize) * int64(cfg.IntermediateSize)
-		params += mlpParams
+	var attnPerLayer int64
+
+	if cfg.KVLoraRank > 0 {
+		// MLA (Multi-Latent Attention): DeepSeek-V2/V3, GLM-5.1
+		kvRank := int64(cfg.KVLoraRank)
+		rope := int64(cfg.QKRopeHeadDim)
+		nope := int64(cfg.QKNopeHeadDim)
+		vDim := int64(cfg.VHeadDim)
+		nh := int64(numHeads)
+		qkHeadDim := nope + rope
+
+		if cfg.QLoraRank > 0 {
+			// Case A (DeepSeek-V2/V3): fused down-proj + separate up-projs with LayerNorms
+			qRank := int64(cfg.QLoraRank)
+			attnPerLayer = h*(qRank+kvRank+rope) + // fused_qkv_a_proj
+				qRank + // q_a_layernorm
+				qRank*nh*qkHeadDim + // q_b_proj
+				kvRank + // kv_a_layernorm
+				kvRank*nh*(nope+vDim) + // kv_b_proj
+				nh*vDim*h // o_proj
+		} else {
+			// Case B (GLM-5.1): direct Q projection, compressed KV
+			attnPerLayer = h*nh*qkHeadDim + // q_proj
+				h*(kvRank+rope) + // kv_a_proj_with_mqa
+				kvRank + // kv_a_layernorm
+				kvRank*nh*(nope+vDim) + // kv_b_proj
+				nh*vDim*h // o_proj
+		}
+	} else {
+		// Standard GQA/MHA attention
+		numKVHeads := cfg.NumKeyValueHeads
+		if numKVHeads == 0 {
+			numKVHeads = numHeads
+		}
+		headDim := int64(cfg.HeadDim)
+		if headDim == 0 {
+			headDim = h / int64(numHeads)
+		}
+		kvDim := int64(numKVHeads) * headDim
+		qDim := int64(numHeads) * headDim
+		attnPerLayer = h*qDim + h*kvDim + h*kvDim + h*qDim
+	}
+
+	// Attention is the same in every layer (not affected by MoE)
+	total += nLayers * attnPerLayer
+	active += nLayers * attnPerLayer
+
+	// --- MLP ---
+	if cfg.NRoutedExperts > 0 && cfg.MoeIntermSize > 0 {
+		// MoE model: some layers are dense, the rest are MoE
+		denseLayers := int64(cfg.FirstKDenseReplace) // e.g. 3 for GLM-5.1
+		moeFreq := cfg.MoeLayerFreq
+		if moeFreq == 0 {
+			moeFreq = 1
+		}
+
+		// Count MoE vs dense layers
+		var moeLayers, nonMoeLayers int64
+		for i := int64(0); i < nLayers; i++ {
+			if i < denseLayers {
+				nonMoeLayers++
+			} else if moeFreq == 1 || (i-denseLayers)%int64(moeFreq) == 0 {
+				moeLayers++
+			} else {
+				nonMoeLayers++
+			}
+		}
+
+		// Dense MLP params: 3 × h × intermediate_size (SwiGLU: gate + up + down)
+		denseMLP := int64(3) * h * int64(cfg.IntermediateSize)
+
+		// Per-expert MLP: 3 × h × moe_intermediate_size
+		expertMLP := int64(3) * h * int64(cfg.MoeIntermSize)
+
+		// Shared expert MLP: same structure as dense but using moe_intermediate_size
+		sharedMLP := int64(0)
+		if cfg.NSharedExperts > 0 {
+			sharedMLP = int64(cfg.NSharedExperts) * 3 * h * int64(cfg.MoeIntermSize)
+		}
+
+		// Router/gate: hidden_size × n_routed_experts per MoE layer
+		routerParams := h * int64(cfg.NRoutedExperts)
+
+		// Total MLP params
+		totalMoeMLP := moeLayers * (int64(cfg.NRoutedExperts)*expertMLP + sharedMLP + routerParams)
+		totalDenseMLP := nonMoeLayers * denseMLP
+		total += totalMoeMLP + totalDenseMLP
+
+		// Active MLP: only top-k experts fire per token
+		topK := cfg.NumExpertsPerTok
+		if topK == 0 {
+			topK = 1
+		}
+		activeMoeMLP := moeLayers * (int64(topK)*expertMLP + sharedMLP + routerParams)
+		active += activeMoeMLP + totalDenseMLP
+	} else if cfg.IntermediateSize > 0 {
+		// Standard dense MLP
+		mlpParams := nLayers * 3 * h * int64(cfg.IntermediateSize)
+		total += mlpParams
+		active += mlpParams
 	}
 
 	// LM head: vocab_size × hidden_size
-	params += int64(cfg.VocabSize) * int64(cfg.HiddenSize)
+	lmHead := int64(cfg.VocabSize) * h
+	total += lmHead
+	active += lmHead
 
-	return params
+	return total, active
 }

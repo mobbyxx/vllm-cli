@@ -113,7 +113,7 @@ func runRun(modelArg string) error {
 		if cfgErr != nil {
 			tui.PrintWarning(fmt.Sprintf("could not fetch model config (%s), skipping memory check", cfgErr.Error()))
 		} else {
-			estimate := memory.Estimate(modelCfg)
+			estimate := memory.Estimate(modelCfg, nil)
 
 			gpuInfo, gpuErr := gpu.Detect()
 			if gpuErr != nil && stderrors.Is(gpuErr, gpu.ErrNoGPU) {

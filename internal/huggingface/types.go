@@ -48,40 +48,57 @@ type QuantConfig struct {
 }
 
 // ModelConfig holds the architecture parameters from config.json.
-// It handles both standard HuggingFace naming (hidden_size, num_hidden_layers, num_attention_heads)
-// and legacy GPT-2 naming (n_embd, n_layer, n_head).
+// It handles standard HuggingFace naming, legacy GPT-2 naming (n_embd, n_layer, n_head),
+// and multimodal models where parameters live in text_config.
 type ModelConfig struct {
 	NumParameters         int64        `json:"num_parameters"`
 	HiddenSize            int          `json:"hidden_size"`
 	NumHiddenLayers       int          `json:"num_hidden_layers"`
 	NumAttentionHeads     int          `json:"num_attention_heads"`
 	NumKeyValueHeads      int          `json:"num_key_value_heads"`
+	HeadDim               int          `json:"head_dim"`
 	IntermediateSize      int          `json:"intermediate_size"`
 	VocabSize             int          `json:"vocab_size"`
 	MaxPositionEmbeddings int          `json:"max_position_embeddings"`
 	TorchDtype            string       `json:"torch_dtype"`
 	QuantizationConfig    *QuantConfig `json:"quantization_config"`
+
+	// MoE (Mixture of Experts) — DeepSeek-V2/V3, GLM-5.1, Mixtral
+	NRoutedExperts     int `json:"n_routed_experts"`
+	NSharedExperts     int `json:"n_shared_experts"`
+	MoeIntermSize      int `json:"moe_intermediate_size"`
+	NumExpertsPerTok   int `json:"num_experts_per_tok"`
+	MoeLayerFreq       int `json:"moe_layer_freq"`
+	FirstKDenseReplace int `json:"first_k_dense_replace"`
+
+	// MLA (Multi-Latent Attention) — DeepSeek-V2/V3, GLM-5.1
+	KVLoraRank    int `json:"kv_lora_rank"`
+	QLoraRank     int `json:"q_lora_rank"`
+	QKNopeHeadDim int `json:"qk_nope_head_dim"`
+	QKRopeHeadDim int `json:"qk_rope_head_dim"`
+	VHeadDim      int `json:"v_head_dim"`
 }
 
-// UnmarshalJSON implements custom JSON unmarshalling to handle both standard
-// HuggingFace naming conventions and legacy GPT-2 style field names.
+// UnmarshalJSON implements custom JSON unmarshalling to handle standard HuggingFace naming,
+// legacy GPT-2 field names, multimodal text_config fallback, and dtype alias.
 func (c *ModelConfig) UnmarshalJSON(data []byte) error {
-	// Use an alias to avoid infinite recursion
 	type Alias ModelConfig
 	aux := &struct {
 		*Alias
-		// GPT-2 style aliases
-		NEmbd  int `json:"n_embd"`
-		NLayer int `json:"n_layer"`
-		NHead  int `json:"n_head"`
-		NCtx   int `json:"n_ctx"`
+		NEmbd      int          `json:"n_embd"`
+		NLayer     int          `json:"n_layer"`
+		NHead      int          `json:"n_head"`
+		NCtx       int          `json:"n_ctx"`
+		Dtype      string       `json:"dtype"`
+		TextConfig *ModelConfig `json:"text_config"`
 	}{
 		Alias: (*Alias)(c),
 	}
 	if err := json.Unmarshal(data, aux); err != nil {
 		return err
 	}
-	// Populate standard fields from GPT-2 aliases if standard fields are zero
+
+	// GPT-2 aliases
 	if c.HiddenSize == 0 && aux.NEmbd != 0 {
 		c.HiddenSize = aux.NEmbd
 	}
@@ -94,5 +111,40 @@ func (c *ModelConfig) UnmarshalJSON(data []byte) error {
 	if c.MaxPositionEmbeddings == 0 && aux.NCtx != 0 {
 		c.MaxPositionEmbeddings = aux.NCtx
 	}
+
+	// "dtype" alias for "torch_dtype" (used by Gemma 4 and others)
+	if c.TorchDtype == "" && aux.Dtype != "" {
+		c.TorchDtype = aux.Dtype
+	}
+
+	// Multimodal fallback: pull text architecture from text_config
+	if aux.TextConfig != nil && c.HiddenSize == 0 {
+		tc := aux.TextConfig
+		c.HiddenSize = tc.HiddenSize
+		c.NumHiddenLayers = tc.NumHiddenLayers
+		c.NumAttentionHeads = tc.NumAttentionHeads
+		c.NumKeyValueHeads = tc.NumKeyValueHeads
+		c.HeadDim = tc.HeadDim
+		c.IntermediateSize = tc.IntermediateSize
+		c.MaxPositionEmbeddings = tc.MaxPositionEmbeddings
+		if tc.VocabSize != 0 {
+			c.VocabSize = tc.VocabSize
+		}
+		if tc.TorchDtype != "" {
+			c.TorchDtype = tc.TorchDtype
+		}
+		c.NRoutedExperts = tc.NRoutedExperts
+		c.NSharedExperts = tc.NSharedExperts
+		c.MoeIntermSize = tc.MoeIntermSize
+		c.NumExpertsPerTok = tc.NumExpertsPerTok
+		c.MoeLayerFreq = tc.MoeLayerFreq
+		c.FirstKDenseReplace = tc.FirstKDenseReplace
+		c.KVLoraRank = tc.KVLoraRank
+		c.QLoraRank = tc.QLoraRank
+		c.QKNopeHeadDim = tc.QKNopeHeadDim
+		c.QKRopeHeadDim = tc.QKRopeHeadDim
+		c.VHeadDim = tc.VHeadDim
+	}
+
 	return nil
 }

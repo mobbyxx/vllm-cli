@@ -9,14 +9,28 @@ import (
 
 // MemoryEstimate holds the breakdown of estimated GPU memory for a model.
 type MemoryEstimate struct {
-	ParameterCount int64   // total params
-	WeightsGB      float64 // params × bytes_per_param / 1e9
-	KVCacheGB      float64 // estimated KV cache
-	OverheadGB     float64 // ~20% + 0.5GB CUDA context
-	TotalGB        float64 // sum of all above
-	Dtype          string  // "float16", "bfloat16", "int4", "int8", "float32"
-	IsQuantized    bool
-	QuantMethod    string // "awq", "gptq", ""
+	ParameterCount       int64
+	ActiveParameterCount int64
+	WeightsGB            float64
+	KVCacheGB            float64
+	CUDAOverheadGB       float64
+	TotalGB              float64
+
+	KVCachePerTokenBytes float64
+
+	GPUTotalGB   float64
+	GPUMemUtil   float64
+	UsableGB     float64
+	KVCacheMaxGB float64
+	MaxTokens    int
+	MaxSeqLen    int
+	EffSeqLen    int
+
+	Dtype       string
+	IsQuantized bool
+	QuantMethod string
+	IsMoE       bool
+	IsMLA       bool
 }
 
 // bytesPerParam returns bytes per parameter for the given dtype.
@@ -43,14 +57,23 @@ func bytesPerParam(dtype string, quantBits int) float64 {
 	}
 }
 
+// EstimateOpts controls GPU-aware memory estimation.
+type EstimateOpts struct {
+	GPUTotalGB float64 // total GPU memory in GB (0 = unknown)
+	GPUMemUtil float64 // vLLM --gpu-memory-utilization (default 0.9)
+}
+
 // Estimate calculates the memory required to load a model.
-func Estimate(cfg *huggingface.ModelConfig) *MemoryEstimate {
+// When GPU info is provided via opts, it computes a realistic breakdown
+// matching vLLM's actual allocation strategy:
+//
+//	weights → CUDA overhead → remaining budget for KV cache.
+func Estimate(cfg *huggingface.ModelConfig, opts *EstimateOpts) *MemoryEstimate {
 	est := &MemoryEstimate{}
 
-	// Determine dtype and quantization
 	est.Dtype = cfg.TorchDtype
 	if est.Dtype == "" {
-		est.Dtype = "float16" // default assumption
+		est.Dtype = "float16"
 	}
 
 	quantBits := 0
@@ -58,7 +81,6 @@ func Estimate(cfg *huggingface.ModelConfig) *MemoryEstimate {
 		est.IsQuantized = true
 		est.QuantMethod = cfg.QuantizationConfig.QuantMethod
 		quantBits = cfg.QuantizationConfig.Bits
-		// Map quantization to dtype string
 		switch quantBits {
 		case 4:
 			est.Dtype = "int4"
@@ -67,47 +89,79 @@ func Estimate(cfg *huggingface.ModelConfig) *MemoryEstimate {
 		}
 	}
 
-	// Parameter count
 	est.ParameterCount = cfg.NumParameters
+	est.ActiveParameterCount = cfg.NumParameters
 	if est.ParameterCount == 0 {
-		est.ParameterCount = huggingface.EstimateParameterCount(cfg)
+		est.ParameterCount, est.ActiveParameterCount = huggingface.EstimateParameterCount(cfg)
 	}
+	est.IsMoE = cfg.NRoutedExperts > 0
+	est.IsMLA = cfg.KVLoraRank > 0
 
-	// Weights memory
 	bpp := bytesPerParam(est.Dtype, quantBits)
 	est.WeightsGB = float64(est.ParameterCount) * bpp / 1e9
 
-	// KV Cache estimate
-	// Formula: 2 × num_layers × num_kv_heads × head_dim × max_seq_len × bytes_per_element / 1e9
-	// head_dim = hidden_size / num_attention_heads
+	// CUDA context + activation memory (empirical, ~500 MB)
+	est.CUDAOverheadGB = 0.5
+
 	numLayers := cfg.NumHiddenLayers
-	numKVHeads := cfg.NumKeyValueHeads
-	if numKVHeads == 0 {
-		numKVHeads = cfg.NumAttentionHeads // fallback to MHA
-	}
-	hiddenSize := cfg.HiddenSize
-	numHeads := cfg.NumAttentionHeads
-	maxSeqLen := cfg.MaxPositionEmbeddings
-	if maxSeqLen == 0 {
-		maxSeqLen = 2048 // conservative default
-	}
-	if maxSeqLen > 8192 {
-		maxSeqLen = 8192 // cap at 8K for estimation purposes
+
+	est.MaxSeqLen = cfg.MaxPositionEmbeddings
+	if est.MaxSeqLen == 0 {
+		est.MaxSeqLen = 2048
 	}
 
-	kvCacheBytes := float64(0)
-	if numLayers > 0 && numKVHeads > 0 && hiddenSize > 0 && numHeads > 0 {
-		headDim := hiddenSize / numHeads
-		// 2 = K + V, 2 bytes per element (fp16)
-		kvCacheBytes = float64(2) * float64(numLayers) * float64(numKVHeads) * float64(headDim) * float64(maxSeqLen) * 2.0
+	if cfg.KVLoraRank > 0 {
+		// MLA: vLLM caches compressed latent (kv_lora_rank + qk_rope_head_dim) per layer
+		elementsPerToken := float64(cfg.KVLoraRank + cfg.QKRopeHeadDim)
+		est.KVCachePerTokenBytes = float64(numLayers) * elementsPerToken * 2.0
+	} else {
+		numKVHeads := cfg.NumKeyValueHeads
+		if numKVHeads == 0 {
+			numKVHeads = cfg.NumAttentionHeads
+		}
+		numHeads := cfg.NumAttentionHeads
+		headDim := 0
+		if numHeads > 0 {
+			headDim = cfg.HeadDim
+			if headDim == 0 {
+				headDim = cfg.HiddenSize / numHeads
+			}
+		}
+		// Standard: 2(K+V) × layers × kv_heads × head_dim × 2 bytes (fp16)
+		if numLayers > 0 && numKVHeads > 0 && headDim > 0 {
+			est.KVCachePerTokenBytes = 2.0 * float64(numLayers) * float64(numKVHeads) * float64(headDim) * 2.0
+		}
 	}
-	est.KVCacheGB = kvCacheBytes / 1e9
 
-	// Overhead: 20% of (weights + kv_cache) + 0.5GB CUDA context
-	est.OverheadGB = (est.WeightsGB+est.KVCacheGB)*0.20 + 0.5
+	gpuMemUtil := 0.9
+	if opts != nil && opts.GPUMemUtil > 0 {
+		gpuMemUtil = opts.GPUMemUtil
+	}
+	est.GPUMemUtil = gpuMemUtil
 
-	// Total
-	est.TotalGB = est.WeightsGB + est.KVCacheGB + est.OverheadGB
+	if opts != nil && opts.GPUTotalGB > 0 {
+		est.GPUTotalGB = opts.GPUTotalGB
+		est.UsableGB = est.GPUTotalGB * gpuMemUtil
+		est.KVCacheMaxGB = est.UsableGB - est.WeightsGB - est.CUDAOverheadGB
+		if est.KVCacheMaxGB < 0 {
+			est.KVCacheMaxGB = 0
+		}
+
+		if est.KVCachePerTokenBytes > 0 {
+			est.MaxTokens = int(est.KVCacheMaxGB * 1e9 / est.KVCachePerTokenBytes)
+		}
+		if est.MaxTokens > est.MaxSeqLen {
+			est.MaxTokens = est.MaxSeqLen
+		}
+		est.EffSeqLen = est.MaxTokens
+
+		est.KVCacheGB = float64(est.EffSeqLen) * est.KVCachePerTokenBytes / 1e9
+		est.TotalGB = est.WeightsGB + est.KVCacheGB + est.CUDAOverheadGB
+	} else {
+		est.EffSeqLen = est.MaxSeqLen
+		est.KVCacheGB = float64(est.EffSeqLen) * est.KVCachePerTokenBytes / 1e9
+		est.TotalGB = est.WeightsGB + est.KVCacheGB + est.CUDAOverheadGB
+	}
 
 	return est
 }
