@@ -14,7 +14,7 @@ import (
 	clierrors "github.com/user/vllm-cli/internal/errors"
 )
 
-const Version = "v0.1.0-dev"
+const Version = "v0.1.1"
 
 var verbose bool
 var configPath string

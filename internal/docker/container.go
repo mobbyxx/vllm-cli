@@ -175,10 +175,11 @@ func (c *Client) ListManaged() ([]types.ContainerInfo, error) {
 		port, _ := strconv.Atoi(portStr)
 
 		result = append(result, types.ContainerInfo{
-			ID:       ctr.ID,
-			ModelRef: ref,
-			Port:     port,
-			Status:   ctr.State,
+			ID:        ctr.ID,
+			ModelRef:  ref,
+			Port:      port,
+			Status:    ctr.State,
+			CreatedAt: time.Unix(ctr.Created, 0),
 		})
 	}
 	return result, nil
